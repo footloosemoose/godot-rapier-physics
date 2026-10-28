@@ -1,0 +1,10 @@
+# Fork only (not for upstream): runs upstream's Windows build on fix/test-motion-sweep's source without the static
+# checks, which fail on v0.36.0 itself with today's stable clippy (fixed upstream after the tag, 455e480 "lint").
+name: Fork Windows build
+on:
+  push:
+    branches: ["ci/windows-test-motion-sweep"]
+jobs:
+  windows-build:
+    name: Windows
+    uses: ./.github/workflows/windows_builds.yml
