@@ -920,6 +920,36 @@ impl PhysicsEngine {
         false
     }
 
+    /// Fraction of `motion` (0..1) at which shape 1, swept by `motion`, first touches static shape 2; None if it never does.
+    /// An initial overlap the motion leaves doesn't stop the cast (the recovery and stuck tests own overlaps).
+    pub fn shapes_cast_toi(
+        &self,
+        shape_info1: ShapeInfo,
+        motion: Vector,
+        shape_info2: ShapeInfo,
+    ) -> Option<Real> {
+        let shape1 = scale_shape(self.get_shape(shape_info1.handle)?, shape_info1);
+        let shape2 = scale_shape(self.get_shape(shape_info2.handle)?, shape_info2);
+        let pos12 = shape_info1.transform.inv_mul(&shape_info2.transform);
+        let vel12 = shape_info1.transform.rotation.inverse() * (-motion);
+        let options = ShapeCastOptions {
+            max_time_of_impact: 1.0,
+            stop_at_penetration: false,
+            compute_impact_geometry_on_penetration: false,
+            ..Default::default()
+        };
+        match separation_ray_query_dispatcher().cast_shapes(
+            &pos12,
+            vel12,
+            shape1.as_ref(),
+            shape2.as_ref(),
+            options,
+        ) {
+            Ok(Some(hit)) => Some(hit.time_of_impact),
+            _ => None,
+        }
+    }
+
     pub fn shapes_contact(
         &self,
         shape_info1: ShapeInfo,

@@ -281,6 +281,113 @@ fn is_end_contact_relevant(contact: &ContactResult, _motion: Vector) -> bool {
 fn contact_collision_point(contact: &ContactResult) -> rapier::prelude::Vector {
     contact.pixel_point2
 }
+/// What the cast phase of a test motion finds for one body shape against one other shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MotionHit {
+    /// Neither the end pose nor the path is blocked by the shape.
+    Clear,
+    /// The end pose overlaps the shape against the motion: bisect for the fractions.
+    AtEnd,
+    /// The end pose isn't blocked, but the swept path first touches the shape at this fraction.
+    Swept(Real),
+}
+/// Whether moving `body_shape_info`'s shape from `origin` by `motion` is blocked by `col_shape_info`.
+///
+/// The end pose alone misses a shape the motion passes all the way through, and one the end pose
+/// overlaps whose cheapest way out is sideways (a box landing on a platform's corner, which the
+/// end-contact filter reads as not opposing the motion). Both end up inside or past a solid, so
+/// when the end pose doesn't block, the shape is swept along the motion as well.
+fn motion_hit_against_shape(
+    physics_engine: &PhysicsEngine,
+    mut body_shape_info: ShapeInfo,
+    origin: Vector,
+    motion: Vector,
+    col_shape_info: ShapeInfo,
+) -> MotionHit {
+    body_shape_info.transform.translation = vector_to_rapier(origin + motion);
+    let end_contact = physics_engine.shapes_contact(body_shape_info, col_shape_info, 0.0);
+    if is_end_contact_relevant(&end_contact, motion) {
+        return MotionHit::AtEnd;
+    }
+    body_shape_info.transform.translation = vector_to_rapier(origin);
+    match physics_engine.shapes_cast_toi(body_shape_info, vector_to_rapier(motion), col_shape_info)
+    {
+        Some(toi) => MotionHit::Swept(toi),
+        None => MotionHit::Clear,
+    }
+}
+/// The safe and unsafe fractions of `motion` against one shape, for a `hit` that isn't `Clear`.
+///
+/// A swept hit stops exactly touching at its time of impact, so its safe fraction backs off by
+/// the distance a blocked motion already treats as negligible: rounding the travel can't then
+/// leave the shape a hair inside.
+#[allow(clippy::too_many_arguments)]
+fn motion_fractions_against_shape(
+    physics_engine: &PhysicsEngine,
+    mut body_shape_info: ShapeInfo,
+    origin: Vector,
+    motion: Vector,
+    col_shape_info: ShapeInfo,
+    hit: MotionHit,
+    cast_iterations: i32,
+    margin: Real,
+) -> (Real, Real) {
+    if let MotionHit::Swept(toi) = hit {
+        let backoff = blocked_motion_tolerance(margin) / vector_length(motion);
+        return ((toi - backoff).max(0.0), toi);
+    }
+    let mut low = 0.0;
+    let mut hi = 1.0;
+    let mut fraction_coeff = 0.5;
+    for k in 0..cast_iterations {
+        let fraction = low + (hi - low) * fraction_coeff;
+        body_shape_info.transform.translation = vector_to_rapier(origin + motion * fraction);
+        let step_contact = physics_engine.shapes_contact(body_shape_info, col_shape_info, 0.0);
+        if step_contact.collided
+            && !step_contact.within_margin
+            && is_motion_blocked_by_contact(&step_contact, motion)
+        {
+            hi = fraction;
+            if (k == 0) || (low > 0.0) {
+                // Did it not collide before?
+                // When alternating or first iteration, use dichotomy.
+                fraction_coeff = 0.5;
+            } else {
+                // When colliding again, converge faster towards low
+                // fraction for more accurate results with long motions
+                // that collide near the start.
+                fraction_coeff = 0.25;
+            }
+        } else {
+            low = fraction;
+            if (k == 0) || (hi < 1.0) {
+                // Did it collide before?
+                // When alternating or first iteration, use dichotomy.
+                fraction_coeff = 0.5;
+            } else {
+                // When not colliding again, converge faster towards
+                // high fraction for more accurate results with long
+                // motions that collide near the end.
+                fraction_coeff = 0.75;
+            }
+        }
+    }
+    (low, hi)
+}
+/// The contact at `fraction` of `motion`, if it blocks the motion.
+fn blocking_contact_at(
+    physics_engine: &PhysicsEngine,
+    mut body_shape_info: ShapeInfo,
+    origin: Vector,
+    motion: Vector,
+    col_shape_info: ShapeInfo,
+    fraction: Real,
+    margin: Real,
+) -> Option<ContactResult> {
+    body_shape_info.transform.translation = vector_to_rapier(origin + motion * fraction);
+    let contact = physics_engine.shapes_contact(body_shape_info, col_shape_info, margin);
+    (contact.collided && is_motion_blocked_by_contact(&contact, motion)).then_some(contact)
+}
 impl RapierSpace {
     pub fn is_handle_excluded_callback(
         &self,
@@ -790,16 +897,14 @@ impl RapierSpace {
                                     col_shape.get_base().get_id(),
                                     col_shape_transform,
                                 );
-                                // Test if going all the way collides
-                                body_shape_info.transform.translation =
-                                    vector_to_rapier(body_shape_transform.origin + p_motion);
-                                let end_contact = physics_engine.shapes_contact(
+                                let hit = motion_hit_against_shape(
+                                    physics_engine,
                                     body_shape_info,
+                                    body_shape_transform.origin,
+                                    p_motion,
                                     col_shape_info,
-                                    0.0,
                                 );
-                                if !is_end_contact_relevant(&end_contact, p_motion) {
-                                    // Doesn't collide at end, skip
+                                if hit == MotionHit::Clear {
                                     continue;
                                 }
                                 // Test initial overlap - if colliding at start position, body might be stuck
@@ -840,65 +945,27 @@ impl RapierSpace {
                                     best_unsafe = 0.0;
                                     break; // Break out of result loop - this shape is stuck
                                 }
-                                //just do kinematic solving
-                                let mut low = 0.0;
-                                let mut hi = 1.0;
-                                let mut fraction_coeff = 0.5;
-                                for k in 0..motion_settings().cast_iterations {
-                                    let fraction = low + (hi - low) * fraction_coeff;
-                                    body_shape_info.transform.translation = vector_to_rapier(
-                                        body_shape_transform.origin + p_motion * fraction,
-                                    );
-                                    let step_contact = physics_engine.shapes_contact(
-                                        body_shape_info,
-                                        col_shape_info,
-                                        0.0,
-                                    );
-                                    if step_contact.collided
-                                        && !step_contact.within_margin
-                                        && is_motion_blocked_by_contact(&step_contact, p_motion)
-                                    {
-                                        hi = fraction;
-                                        if (k == 0) || (low > 0.0) {
-                                            // Did it not collide before?
-                                            // When alternating or first iteration, use dichotomy.
-                                            fraction_coeff = 0.5;
-                                        } else {
-                                            // When colliding again, converge faster towards low
-                                            // fraction for more accurate results with long motions
-                                            // that collide near the start.
-                                            fraction_coeff = 0.25;
-                                        }
-                                    } else {
-                                        low = fraction;
-                                        if (k == 0) || (hi < 1.0) {
-                                            // Did it collide before?
-                                            // When alternating or first iteration, use dichotomy.
-                                            fraction_coeff = 0.5;
-                                        } else {
-                                            // When not colliding again, converge faster towards
-                                            // high fraction for more accurate results with long
-                                            // motions that collide near the end.
-                                            fraction_coeff = 0.75;
-                                        }
-                                    }
-                                }
-                                body_shape_info.transform.translation = vector_to_rapier(
-                                    body_shape_transform.origin
-                                        + p_motion
-                                            * (hi + self.get_contact_max_allowed_penetration()),
-                                );
-                                let contact = physics_engine.shapes_contact(
+                                let (low, hi) = motion_fractions_against_shape(
+                                    physics_engine,
                                     body_shape_info,
+                                    body_shape_transform.origin,
+                                    p_motion,
                                     col_shape_info,
+                                    hit,
+                                    motion_settings().cast_iterations,
                                     p_margin,
                                 );
-                                if !contact.collided {
+                                let Some(contact) = blocking_contact_at(
+                                    physics_engine,
+                                    body_shape_info,
+                                    body_shape_transform.origin,
+                                    p_motion,
+                                    col_shape_info,
+                                    hi + self.get_contact_max_allowed_penetration(),
+                                    p_margin,
+                                ) else {
                                     continue;
-                                }
-                                if !is_motion_blocked_by_contact(&contact, p_motion) {
-                                    continue;
-                                }
+                                };
                                 if physics_engine.should_skip_collision_one_dir(
                                     &contact,
                                     body_shape,
@@ -1639,5 +1706,211 @@ mod tests {
         assert_eq!(result.collision_depth, 0.0);
         assert_eq!(result.collision_safe_fraction, 1.0);
         assert_eq!(result.collision_unsafe_fraction, 1.0);
+    }
+    /// The cast phase of a test motion, one body shape against one other shape, with the margin a
+    /// CharacterBody2D uses: a 70x90 box (the body) against a 192x32 box centred at the origin
+    /// (x -96..96, y -16..16), as in a corner-landing repro from a game.
+    #[cfg(feature = "dim2")]
+    mod cast_phase {
+        use super::*;
+        const BOX: Vector = Vector::new(70.0, 90.0);
+        const PLATFORM: Vector = Vector::new(192.0, 32.0);
+        const MARGIN: Real = 0.08;
+        const ITERATIONS: i32 = 8;
+        struct Scene {
+            engine: PhysicsEngine,
+        }
+        impl Scene {
+            fn new() -> Self {
+                let mut engine = PhysicsEngine::default();
+                engine.shape_create_box(vector_to_rapier(BOX), 1);
+                engine.shape_create_box(vector_to_rapier(PLATFORM), 2);
+                Scene { engine }
+            }
+            /// Where the box is for its bottom edge `pen` into the platform's top face (negative:
+            /// a gap above it), and its right edge `xo` past the platform's left edge.
+            fn box_at(pen: Real, xo: Real) -> Vector {
+                Vector::new(-96.0 + xo - BOX.x / 2.0, -16.0 + pen - BOX.y / 2.0)
+            }
+            fn info(handle: ShapeHandle, origin: Vector) -> ShapeInfo {
+                shape_info_from_body_shape(handle, Transform::from_angle_origin(0.0, origin))
+            }
+            fn hit(&self, origin: Vector, motion: Vector, platform_at: Vector) -> MotionHit {
+                motion_hit_against_shape(
+                    &self.engine,
+                    Self::info(1, origin),
+                    origin,
+                    motion,
+                    Self::info(2, platform_at),
+                )
+            }
+            /// The (safe, unsafe) fractions and the blocking contact, or None where the cast
+            /// phase lets the motion through, composed as `cast_motion` composes them (its stuck
+            /// test and one-way filter aside).
+            fn cast(
+                &self,
+                origin: Vector,
+                motion: Vector,
+                platform_at: Vector,
+            ) -> Option<(Real, Real, ContactResult)> {
+                let body = Self::info(1, origin);
+                let platform = Self::info(2, platform_at);
+                let hit = motion_hit_against_shape(&self.engine, body, origin, motion, platform);
+                if hit == MotionHit::Clear {
+                    return None;
+                }
+                let (low, hi) = motion_fractions_against_shape(
+                    &self.engine,
+                    body,
+                    origin,
+                    motion,
+                    platform,
+                    hit,
+                    ITERATIONS,
+                    MARGIN,
+                );
+                blocking_contact_at(&self.engine, body, origin, motion, platform, hi, MARGIN)
+                    .map(|contact| (low, hi, contact))
+            }
+        }
+        /// The box is clear of the platform at `fraction` of `motion` from `origin`.
+        fn clear_at(scene: &Scene, origin: Vector, motion: Vector, fraction: Real) -> bool {
+            let contact = scene.engine.shapes_contact(
+                Scene::info(1, origin + motion * fraction),
+                Scene::info(2, Vector::ZERO),
+                0.0,
+            );
+            !contact.collided || contact.pixel_distance >= 0.0
+        }
+        #[test]
+        fn corner_graze_landing_is_blocked_on_the_top_face() {
+            // Right edge 1 px past the platform's left edge, 1 px above its top, falling 16 px:
+            // at the end the box is 15 px deep but only 1 px across, so the end contact's normal
+            // is sideways and the end-contact filter alone let the box fall into the platform.
+            let scene = Scene::new();
+            let origin = Scene::box_at(-1.0, 1.0);
+            let motion = Vector::new(0.0, 16.0);
+            assert!(matches!(
+                scene.hit(origin, motion, Vector::ZERO),
+                MotionHit::Swept(_)
+            ));
+            let (safe, unsafe_, contact) = scene
+                .cast(origin, motion, Vector::ZERO)
+                .expect("the swept corner graze blocks the fall");
+            assert!((unsafe_ - 1.0 / 16.0).abs() < 1e-3, "unsafe {unsafe_}");
+            assert!(
+                safe < unsafe_,
+                "safe {safe} backs off from unsafe {unsafe_}"
+            );
+            assert!(
+                unsafe_ - safe < 1e-3,
+                "safe {safe} stays next to unsafe {unsafe_}"
+            );
+            assert!(clear_at(&scene, origin, motion, safe));
+            assert!(
+                vector_to_godot(contact.normal2).y < -0.99,
+                "{:?}",
+                contact.normal2
+            );
+        }
+        #[test]
+        fn corner_graze_already_touching_does_not_sink() {
+            // The same graze with the box resting exactly on the top face: it can't move down.
+            let scene = Scene::new();
+            for xo in [0.2, 1.0, 2.0, 5.0] {
+                let origin = Scene::box_at(0.0, xo);
+                let (safe, _, _) = scene
+                    .cast(origin, Vector::new(0.0, 8.0), Vector::ZERO)
+                    .unwrap_or_else(|| panic!("xo {xo}: resting on the corner blocks the fall"));
+                assert!(safe * 8.0 < 1e-2, "xo {xo}: travel {}", safe * 8.0);
+            }
+        }
+        #[test]
+        fn passing_through_a_platform_is_blocked() {
+            // 100 px above the top, moving 400 px down: the end pose is past the platform.
+            let scene = Scene::new();
+            let origin = Scene::box_at(-100.0, 133.0);
+            let motion = Vector::new(0.0, 400.0);
+            match scene.hit(origin, motion, Vector::ZERO) {
+                MotionHit::Swept(toi) => assert!((toi - 0.25).abs() < 1e-4, "toi {toi}"),
+                hit => panic!("{hit:?}"),
+            }
+            let (safe, unsafe_, _) = scene
+                .cast(origin, motion, Vector::ZERO)
+                .expect("the swept path blocks the fall");
+            assert!((unsafe_ - 0.25).abs() < 1e-4, "unsafe {unsafe_}");
+            assert!(safe < unsafe_ && clear_at(&scene, origin, motion, safe));
+        }
+        #[test]
+        fn landing_with_the_end_pose_inside_still_bisects() {
+            // Fully over the platform, 10 px above, moving 20 px down: the end contact opposes
+            // the motion, so the bisection path is unchanged.
+            let scene = Scene::new();
+            let origin = Scene::box_at(-10.0, 133.0);
+            let motion = Vector::new(0.0, 20.0);
+            assert_eq!(scene.hit(origin, motion, Vector::ZERO), MotionHit::AtEnd);
+            let (safe, unsafe_, _) = scene.cast(origin, motion, Vector::ZERO).unwrap();
+            assert!(safe <= 0.5 && unsafe_ >= 0.5 && unsafe_ - safe < 0.01);
+        }
+        #[test]
+        fn sliding_down_a_wall_is_not_blocked() {
+            // The box beside the platform's left face, in its span, moving down along it:
+            // touching, inside the margin, and a hair into the face.
+            let scene = Scene::new();
+            for xo in [0.0, -0.05, 0.01] {
+                let origin = Vector::new(-96.0 + xo - BOX.x / 2.0, 0.0);
+                for motion in [Vector::new(0.0, 8.0), Vector::new(0.0, -8.0)] {
+                    assert!(
+                        scene.cast(origin, motion, Vector::ZERO).is_none(),
+                        "xo {xo} motion {motion:?}"
+                    );
+                }
+            }
+        }
+        #[test]
+        fn sliding_along_a_floor_seam_is_not_blocked() {
+            // Two platforms side by side (a tile seam at x 96), the box resting on top,
+            // running across the seam: touching, and inside the margin.
+            let scene = Scene::new();
+            for gap in [0.0, 0.05] {
+                let origin = Vector::new(96.0 - BOX.x / 2.0 - 1.0, -16.0 - gap - BOX.y / 2.0);
+                let motion = Vector::new(16.0, 0.0);
+                for platform_at in [Vector::ZERO, Vector::new(192.0, 0.0)] {
+                    assert!(
+                        scene.cast(origin, motion, platform_at).is_none(),
+                        "gap {gap} platform at {platform_at:?}"
+                    );
+                }
+            }
+        }
+        #[test]
+        fn one_way_platform_passes_from_below_and_holds_from_above() {
+            // A one-way platform collides only for motion along its valid direction (down):
+            // jumping up through it from below, the swept contact is on its far side for the
+            // one-way filter and is skipped; landing on it from above is blocked.
+            let scene = Scene::new();
+            let valid_dir = Vector::new(0.0, 1.0);
+            let below = Vector::new(0.0, 16.0 + 10.0 + BOX.y / 2.0);
+            let up = Vector::new(0.0, -200.0);
+            assert!(matches!(
+                scene.hit(below, up, Vector::ZERO),
+                MotionHit::Swept(_)
+            ));
+            let (_, _, contact) = scene.cast(below, up, Vector::ZERO).unwrap();
+            assert!(is_one_way_contact_invalid(
+                &contact,
+                valid_dir,
+                OneWayDepthLimit::Unlimited
+            ));
+            let above = Scene::box_at(-100.0, 133.0);
+            let (_, _, contact) = scene
+                .cast(above, Vector::new(0.0, 400.0), Vector::ZERO)
+                .unwrap();
+            assert!(!is_one_way_contact_invalid(
+                &contact,
+                valid_dir,
+                OneWayDepthLimit::Unlimited
+            ));
+        }
     }
 }
